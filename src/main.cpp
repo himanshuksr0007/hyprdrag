@@ -71,7 +71,7 @@ static void handleDragEnd() {
 // motion that finds a target, exactly how the original callback version
 // detected it.
 static void checkDragState() {
-    const auto controller = g_layoutManager ? g_layoutManager->dragController() : nullptr;
+    const auto* controller = g_layoutManager ? g_layoutManager->dragController().get() : nullptr;
     const auto target     = controller ? controller->target() : nullptr;
     const auto window     = target ? target->window() : nullptr;
 
