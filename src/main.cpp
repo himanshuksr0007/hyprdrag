@@ -9,6 +9,7 @@
 
 #include <hyprland/src/ipc/s2/S2.hpp>
 #include <hyprland/src/layout/LayoutManager.hpp>
+#include <hyprland/src/managers/input/InputManager.hpp>
 
 #include "globals.hpp"
 
@@ -33,6 +34,12 @@ static constexpr const char* EVENT_DRAG_MOVE_START   = "hyprdrag-movestart";
 static constexpr const char* EVENT_DRAG_MOVE_STOP    = "hyprdrag-movestop";
 static constexpr const char* EVENT_DRAG_RESIZE_START = "hyprdrag-resizestart";
 static constexpr const char* EVENT_DRAG_RESIZE_STOP  = "hyprdrag-resizestop";
+// Posted on every motion while a drag runs, with the dragged window's
+// live geometry and the cursor: 0xADDR,X,Y,W,H,CX,CY. A consumer that
+// polls hyprctl can only follow a drag in steps; this is the drag at
+// its own rate.
+static constexpr const char* EVENT_DRAG_MOVE_MOTION   = "hyprdrag-movemotion";
+static constexpr const char* EVENT_DRAG_RESIZE_MOTION = "hyprdrag-resizemotion";
 
 static void handleDragEvent(PHLWINDOW window, bool isMoving, bool isStart) {
     if (!window) {
@@ -87,6 +94,14 @@ static void checkDragState() {
         handleDragEnd();
     }
 
+    if (isCurrentlyDragging) { // the drag at its own rate (see the event names above)
+        const auto box   = target->position();
+        const auto mouse = g_pInputManager->getMouseCoordsInternal();
+        IPC::Socket2::sock()->postEvent({.event = wasMoving ? EVENT_DRAG_MOVE_MOTION : EVENT_DRAG_RESIZE_MOTION,
+                                         .data  = std::format("0x{:x},{:.0f},{:.0f},{:.0f},{:.0f},{:.0f},{:.0f}",
+                                                              reinterpret_cast<uintptr_t>(window.get()), box.x, box.y, box.w, box.h, mouse.x, mouse.y)});
+    }
+
     wasCurrentlyDragging = isCurrentlyDragging;
 }
 
@@ -113,7 +128,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         dragEndedListener      = controller->m_events.ended.listen([] { onDragEnded(); });
     }
 
-    return {"hyprdrag", "Window move/resize interaction plugin", "yz778", "0.2.0"};
+    return {"hyprdrag", "Window move/resize interaction plugin", "yz778", "0.3.0"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
