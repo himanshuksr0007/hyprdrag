@@ -1,5 +1,7 @@
 # hyprdrag
 
+> Fork of [yz778/hyprdrag](https://github.com/yz778/hyprdrag), ported to the Hyprland 0.57 plugin API (the original no longer builds there: the event manager and the input manager's drag state it used were removed, and drag state now lives in the layout manager's drag controller). The four IPC events are unchanged. One difference: the `tag:hyprdrag-move` / `tag:hyprdrag-resize` window tags are not set anymore, because the `tagwindow` dispatch behind them no longer exists in 0.57.
+
 `hyprdrag` is a Hyprland plugin to enable windowrules and IPC events for window move and resize events. This opens up many possibilities using standard `windowrule` configurations. Here is an example demonstrating transparency while moving and resizing windows:
 
 https://github.com/user-attachments/assets/ab72bcab-2743-4419-9402-9c62e67f6aac

@@ -7,11 +7,8 @@
 #include <chrono>
 #include <format>
 
-#define private public
-#include <hyprland/src/Compositor.hpp>
-#include <hyprland/src/managers/input/InputManager.hpp>
-#include <hyprland/src/managers/EventManager.hpp>
-#undef private
+#include <hyprland/src/ipc/s2/S2.hpp>
+#include <hyprland/src/layout/LayoutManager.hpp>
 
 #include "globals.hpp"
 
@@ -20,9 +17,11 @@ APICALL EXPORT std::string PLUGIN_API_VERSION() {
     return HYPRLAND_API_VERSION;
 }
 
-// Callback storage
-static SP<HOOK_CALLBACK_FN> mouseMoveCallback = nullptr;
-static SP<HOOK_CALLBACK_FN> mouseButtonCallback = nullptr;
+// Listener handles for the drag controller's own signals. A listener stays
+// registered while its handle lives, so these are file-static; PLUGIN_EXIT
+// resets them, which unregisters.
+static CHyprSignalListener dragMotionListener;
+static CHyprSignalListener dragEndedListener;
 
 // State tracking variables
 static bool wasCurrentlyDragging = false;
@@ -30,14 +29,10 @@ static bool wasMoving = false;
 static PHLWINDOW lastDraggedWindow = nullptr;
 
 // Cached string constants
-static constexpr const char* EVENT_DRAG_MOVE_START      = "hyprdrag-movestart";
-static constexpr const char* EVENT_DRAG_MOVE_STOP       = "hyprdrag-movestop";
-static constexpr const char* EVENT_DRAG_RESIZE_START    = "hyprdrag-resizestart";
-static constexpr const char* EVENT_DRAG_RESIZE_STOP     = "hyprdrag-resizestop";
-static constexpr const char* TAG_DRAGGING_MOVE          = "hyprdrag-move";
-static constexpr const char* TAG_DRAGGING_RESIZE        = "hyprdrag-resize";
-static constexpr const char* TAG_REMOVE_DRAGGING_MOVE   = "-hyprdrag-move";
-static constexpr const char* TAG_REMOVE_DRAGGING_RESIZE = "-hyprdrag-resize";
+static constexpr const char* EVENT_DRAG_MOVE_START   = "hyprdrag-movestart";
+static constexpr const char* EVENT_DRAG_MOVE_STOP    = "hyprdrag-movestop";
+static constexpr const char* EVENT_DRAG_RESIZE_START = "hyprdrag-resizestart";
+static constexpr const char* EVENT_DRAG_RESIZE_STOP  = "hyprdrag-resizestop";
 
 static void handleDragEvent(PHLWINDOW window, bool isMoving, bool isStart) {
     if (!window) {
@@ -52,17 +47,13 @@ static void handleDragEvent(PHLWINDOW window, bool isMoving, bool isStart) {
         {EVENT_DRAG_RESIZE_START, EVENT_DRAG_MOVE_START}  // start events
     };
 
-    static constexpr const char* tags[2][2] = {
-        {TAG_REMOVE_DRAGGING_RESIZE, TAG_REMOVE_DRAGGING_MOVE}, // end tags
-        {TAG_DRAGGING_RESIZE, TAG_DRAGGING_MOVE}                // start tags
-    };
+    // Send IPC event. (Up to Hyprland 0.56 this went through the event
+    // manager; 0.57 posts straight to the socket2 implementation.)
+    IPC::Socket2::sock()->postEvent({.event = events[isStart][isMoving], .data = address});
 
-    // Send IPC event
-    g_pEventManager->postEvent(SHyprIPCEvent{events[isStart][isMoving], address});
-
-    // Tag the window using hyprctl
-    std::string tagCommand = std::format("tagwindow {} address:{}", tags[isStart][isMoving], address);
-    HyprlandAPI::invokeHyprctlCommand("dispatch", tagCommand);
+    // The window tags the original plugin set here (tag:hyprdrag-move /
+    // tag:hyprdrag-resize, for windowrules) are gone: the tagwindow dispatch
+    // they relied on no longer exists in 0.57.
 }
 
 static void handleDragEnd() {
@@ -74,37 +65,33 @@ static void handleDragEnd() {
     lastDraggedWindow = nullptr;
 }
 
-void onMouseMove(void* self, SCallbackInfo& info, std::any param) {
-    const auto dragMode = g_pInputManager->m_dragMode;
-    const bool isMoving = dragMode == MBIND_MOVE;
-    bool isCurrentlyDragging = !g_pInputManager->m_currentlyDraggedWindow.expired();
+// The drag state lives in the layout manager's drag controller since 0.57
+// (it was the input manager's dragged window before). Its motion signal
+// fires on mouse moves while a drag is running, so a begin is the first
+// motion that finds a target, exactly how the original callback version
+// detected it.
+static void checkDragState() {
+    const auto controller = g_layoutManager ? g_layoutManager->dragController() : nullptr;
+    const auto target     = controller ? controller->target() : nullptr;
+    const auto window     = target ? target->window() : nullptr;
 
-    auto currentDraggedWindow = g_pInputManager->m_currentlyDraggedWindow.lock();
+    const bool isCurrentlyDragging = !!window;
 
     if (isCurrentlyDragging && !wasCurrentlyDragging) { // Drag started
-        wasMoving = isMoving;
+        const auto mode = controller->mode();
+        wasMoving       = mode == MBIND_MOVE;
 
-        if (currentDraggedWindow) {
-            lastDraggedWindow = currentDraggedWindow;
-            handleDragEvent(currentDraggedWindow, isMoving, true);
-        }
-    } else if (!isCurrentlyDragging && wasCurrentlyDragging) { // Drag ended
+        lastDraggedWindow = window;
+        handleDragEvent(window, wasMoving, true);
+    } else if (!isCurrentlyDragging && wasCurrentlyDragging) { // Drag ended without an end signal
         handleDragEnd();
     }
 
     wasCurrentlyDragging = isCurrentlyDragging;
 }
 
-void onMouseButton(void* self, SCallbackInfo& info, std::any param) {
-    auto event = std::any_cast<IPointer::SButtonEvent>(param);
-
-    // Only care about button releases
-    if (event.state != WL_POINTER_BUTTON_STATE_RELEASED) {
-        return;
-    }
-
-    // Check if we were dragging and now we're not
-    if (wasCurrentlyDragging && g_pInputManager->m_currentlyDraggedWindow.expired()) {
+static void onDragEnded() {
+    if (wasCurrentlyDragging) {
         handleDragEnd();
         wasCurrentlyDragging = false;
     }
@@ -120,14 +107,18 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         throw std::runtime_error("[hyprdrag] Version mismatch");
     }
 
-    // Register mouse move callback instead of drag callbacks
-    mouseMoveCallback = HyprlandAPI::registerCallbackDynamic(PHANDLE, "mouseMove", onMouseMove);
+    if (g_layoutManager) {
+        const auto& controller = g_layoutManager->dragController();
+        dragMotionListener     = controller->m_events.motion.listen([] { checkDragState(); });
+        dragEndedListener      = controller->m_events.ended.listen([] { onDragEnded(); });
+    }
 
-    return {"hyprdrag", "Window move/resize interaction plugin", "yz778", "0.1.3"};
+    return {"hyprdrag", "Window move/resize interaction plugin", "yz778", "0.2.0"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
-    mouseMoveCallback = nullptr;
+    dragMotionListener = {};
+    dragEndedListener  = {};
     wasCurrentlyDragging = false;
     lastDraggedWindow = nullptr;
 }
